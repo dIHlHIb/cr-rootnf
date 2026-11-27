@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 dIHlHIb
+# Developed with AI assistance.
+"""Rebuild the independent audit. Usage: ./recheck [--table] [--work DIR]."""
+import argparse
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tempfile
+
+p=argparse.ArgumentParser(description=__doc__)
+p.add_argument("--work", type=Path, help="directory for raw results; defaults to a temporary directory")
+p.add_argument("--table",action="store_true",help="also validate every producer log-table entry")
+args=p.parse_args()
+base=Path(__file__).resolve().parent
+data=base.parent
+cc=shlex.split(os.environ.get("CC","cc"))
+
+def flags(var,arg,default):
+    if var in os.environ:
+        return shlex.split(os.environ[var])
+    try:
+        return shlex.split(subprocess.check_output(["pkg-config",arg,"mpfr"],text=True))
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return default
+
+inc=flags("MPFR_CFLAGS","--cflags",[])
+libs=flags("MPFR_LIBS","--libs",["-lmpfr","-lgmp"])
+env=dict(os.environ,MPFR_CFLAGS=shlex.join(inc),MPFR_LIBS=shlex.join(libs))
+with tempfile.TemporaryDirectory() as tmp:
+    out=args.work.resolve() if args.work else Path(tmp)/"results"
+    out.mkdir(parents=True, exist_ok=True)
+    scanner=Path(tmp)/"independent"
+    subprocess.run(cc+["-O3","-std=gnu11",*inc,base/"rescan.c",*libs,"-lm","-o",scanner],check=True)
+    for job in ["cubes","-5488","8649606","595995026","-1454496471","shard"]:
+        with (out/f"ours-{job}.txt").open("w") as rows, (out/f"ours-{job}.log").open("w") as log:
+            subprocess.run([scanner,job],stdout=rows,stderr=log,check=True)
+    result=subprocess.run([sys.executable,base/"compare.py",data],cwd=out,capture_output=True,text=True)
+    (out/"comparison.log").write_text(result.stdout)
+    print(result.stdout, end="",flush=True)
+    if result.returncode: sys.exit(result.stderr or result.returncode)
+    exact=subprocess.check_output([sys.executable,base/"exact_set.py",data/"rootnf_exact.wc"],text=True)
+    (out/"exact-set.log").write_text(exact)
+    print(exact,end="",flush=True)
+    margins=Path(tmp)/"margins"
+    subprocess.run(cc+["-O2",*inc,base/"margins.c",*libs,"-lm","-o",margins],check=True)
+    with (out/"nonexact-grids.txt").open("rb") as inp:
+        limits=subprocess.check_output([margins],stdin=inp,text=True)
+    (out/"margins.log").write_text(limits)
+    print(limits,end="",flush=True)
+    subprocess.run([sys.executable,base/"test_wc.py",data],env=env,cwd=out,check=True)
+    fixture=subprocess.check_output([sys.executable,base/"make_fixture.py",data])
+    published=base.parents[1]/"src/binary32/rootn/rootnf.wc"
+    if fixture != published.read_bytes(): sys.exit("release fixture differs")
+    if args.table:
+        program=Path(tmp)/"log-table"
+        subprocess.run(cc+["-O3","-ffp-contract=off","-I",data/"scan",*inc,base/"table_certificate.c",
+                           *libs,"-lm","-o",program],check=True)
+        text=subprocess.check_output([program],text=True)
+        (out/"log-table.log").write_text(text)
+        print(text,end="")

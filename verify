@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 dIHlHIb
+# Developed with AI assistance.
+"""Build in a temporary directory and check both results and IEEE flags."""
+import argparse
+import gzip
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+root = Path(__file__).resolve().parent
+src = root / "src/binary32/rootn"
+tests = root / "tests"
+data = tests / "data"
+parser = argparse.ArgumentParser()
+parser.add_argument("--lean", metavar="LEAN", help="also check the arithmetic model with Lean 4.19")
+parser.add_argument("--glibc-reference", type=Path, help="glibc 2.44 math/auto-libm-test-out-rootn")
+args = parser.parse_args()
+
+
+def pkg_flags(kind, override, default):
+    if override in os.environ:
+        return shlex.split(os.environ[override])
+    if shutil.which("pkg-config"):
+        p = subprocess.run(["pkg-config", kind, "mpfr"], capture_output=True, text=True)
+        if p.returncode == 0:
+            return shlex.split(p.stdout)
+    return default
+
+
+cc = shlex.split(os.environ.get("CC", "cc"))
+cc += shlex.split(os.environ.get("CFLAGS", "-O2"))
+cc += ["-std=gnu11", "-ffp-contract=off", "-frounding-math", "-fno-math-errno"]
+inc = pkg_flags("--cflags", "MPFR_CFLAGS", [])
+libs = pkg_flags("--libs", "MPFR_LIBS", ["-lmpfr", "-lgmp"])
+run = subprocess.run
+with tempfile.TemporaryDirectory(prefix="rootnf-check-") as tmp:
+    work = Path(tmp)
+    obj = work / "rootnf.o"
+    run(cc + ["-DCORE_MATH_SUPPORT_ERRNO", "-c", src/"rootnf.c", "-o", obj], check=True)
+    run(cc + inc + [src/"check_special.c", obj, *libs, "-lm", "-o", work/"check"], check=True)
+    run([sys.executable, tests/"check_tables.py"], check=True)
+    seed = work/"seed"
+    seed.write_bytes(gzip.decompress((data/"seed-cases.txt.gz").read_bytes()))
+    with (work/"cases").open("wb") as out:
+        run([sys.executable, tests/"exact_cases.py", seed], stdout=out, check=True)
+    with (work/"cases").open("rb") as inp:
+        run([work/"check"], stdin=inp, check=True)
+    with (work/"large-degrees").open("wb") as out:
+        run([sys.executable, tests/"large_degree_cases.py"], stdout=out, check=True)
+    with (work/"large-degrees").open("rb") as inp:
+        run([work/"check"], stdin=inp, check=True)
+    with (src/"rootnf.wc").open("rb") as inp:
+        run([work/"check", "--worst"], stdin=inp, check=True)
+    if args.glibc_reference:
+        run(cc + ["-DONLY_CANDIDATE", tests/"public_vectors.c", obj, "-lm", "-o", work/"public"], check=True)
+        vectors = subprocess.check_output([sys.executable, tests/"public_vectors.py", args.glibc_reference])
+        run([work/"public"], input=vectors, check=True)
+    for mutate in (False, True):
+        hdr = (src/"power_interval.h").read_text()
+        if mutate:
+            assert hdr.count("if (upward && discarded)") == 1
+            hdr = hdr.replace("if (upward && discarded)", "if (0 && upward && discarded)")
+        (work/"power_interval.h").write_text(hdr)
+        run(cc + inc + ["-DROOTNF_INITIAL_LIMBS=1", "-I", work, tests/"check_interval.c",
+                        *libs, "-lm", "-o", work/"bounds"], check=True)
+        with seed.open("rb") as inp:
+            code = run([work/"bounds"], stdin=inp).returncode
+        if mutate and code == 1:
+            print("Deliberately corrupted rounding was detected.", flush=True)
+        if code != int(mutate):
+            sys.exit(f"Unexpected interval test status {code} for mutation={mutate}")
+    if args.lean:
+        run([args.lean, "-o", work/"PowerInterval.olean", root/"proof/PowerInterval.lean"], cwd=root, check=True)
+        run([args.lean, "-o", work/"LargeDegree.olean", root/"proof/LargeDegree.lean"], cwd=root, check=True)

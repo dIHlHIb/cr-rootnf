@@ -1,0 +1,4 @@
+*.o
+*.a
+src/binary32/rootn/check_special
+__pycache__/
