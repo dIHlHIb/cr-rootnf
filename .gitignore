@@ -2,3 +2,6 @@
 *.a
 src/binary32/rootn/check_special
 __pycache__/
+.DS_Store
+._*
+__MACOSX/
